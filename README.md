@@ -74,7 +74,25 @@ When adding a new database in Metabase, select "Flink SQL" and configure:
 | Port | SQL Gateway REST port | 8083 |
 | Catalog | Flink catalog name (optional) | default_catalog |
 | Database | Flink database name (optional) | default_database |
+| Streaming Query Timeout | Timeout for streaming queries (seconds) | 30 |
 | Additional Options | Extra JDBC URL parameters | - |
+
+### Streaming Query Timeout
+
+The driver includes a unique **streaming query timeout** feature that enables querying unbounded streaming tables (like Kafka) without hanging forever!
+
+**How it works:**
+1. Query executes against the streaming source
+2. Rows are collected as they stream in
+3. After the timeout, partial results are returned
+4. The query is cancelled to free resources
+
+**Configuration:**
+- Default: 30 seconds
+- Set to 0 to disable (queries will hang on unbounded tables)
+- Adjust based on your expected query duration
+
+**Example:** If you query a Kafka table without bounded mode, the query will return whatever rows were collected within 30 seconds instead of hanging forever.
 
 ### Multi-Catalog Support
 
@@ -153,25 +171,36 @@ Before using this driver, ensure your Flink cluster has the SQL Gateway running:
 
 *DDL statements work but tables are session-scoped (see DDL Support section below)
 
-## Supported Table Types and Streaming Limitation
+## Supported Table Types and Streaming Support
 
 ### How Flink JDBC Works
 
 The Flink JDBC driver operates in **batch mode only** (per [FLIP-293](https://cwiki.apache.org/confluence/display/FLINK/FLIP-293%3A+Introduce+Flink+JDBC+Driver)). This means:
 - Queries must return **finite result sets**
-- **Unbounded streaming tables** will hang forever
-- This is by design, not a driver bug
+- **Unbounded streaming tables** would normally hang forever
+- This driver includes a **streaming timeout** feature to work around this!
+
+### Streaming Query Timeout (NEW!)
+
+This driver adds a unique feature: **streaming query timeout**. Instead of hanging forever on unbounded tables, queries will:
+1. Collect rows as they stream in
+2. Return partial results after the configured timeout (default: 30 seconds)
+3. Cancel the query to free resources
+
+This means you CAN query unbounded streaming tables like Kafka - you'll get a sample of the data!
 
 ### Supported Connectors
 
 | Connector | Configuration | Works? | Notes |
 |-----------|--------------|--------|-------|
-| `datagen` with rows | `'number-of-rows' = '10000'` | Yes | Finite data, full SQL support |
-| `datagen` without rows | No `number-of-rows` | **No** | Unbounded stream, queries hang |
-| `filesystem` | CSV, Parquet files | Yes | Bounded by file content |
-| `jdbc` | External database | Yes | Bounded by source query |
-| `kafka` unbounded | No bounded mode | **No** | Infinite stream, queries hang |
-| `kafka` bounded | `'scan.bounded.mode' = 'latest-offset'` | Yes | Treats stream as snapshot |
+| `datagen` with rows | `'number-of-rows' = '10000'` | ✅ Yes | Finite data, full SQL support |
+| `datagen` without rows | No `number-of-rows` | ✅ Yes* | Returns partial results after timeout |
+| `filesystem` | CSV, Parquet files | ✅ Yes | Bounded by file content |
+| `jdbc` | External database | ✅ Yes | Bounded by source query |
+| `kafka` unbounded | No bounded mode | ✅ Yes* | Returns partial results after timeout |
+| `kafka` bounded | `'scan.bounded.mode' = 'latest-offset'` | ✅ Yes | Treats stream as snapshot (recommended) |
+
+*With streaming timeout enabled (default). Set timeout to 0 to restore original hanging behavior.
 
 ### Querying Kafka Tables
 
@@ -202,31 +231,33 @@ CREATE TABLE kafka_events (
 | `specific-offsets` | Read to specific partition offsets | Precise boundaries |
 | `group-offsets` | Bounded by consumer group commits | Resume from checkpoint |
 
-### Why Unbounded Tables Hang
+### Why Unbounded Tables Would Hang (Without Timeout)
 
 When you query an unbounded table (streaming source without bounds):
 1. Flink starts reading from the source
 2. JDBC waits for the query to "complete"
 3. An unbounded stream **never completes**
-4. The query hangs forever
+4. Without timeout: query hangs forever
+5. **With timeout (default)**: partial results returned after 30 seconds!
 
-This is expected behavior. To fix it, either:
-- Use bounded connectors (datagen with rows, filesystem, etc.)
-- Configure streaming connectors with bounded mode (`scan.bounded.mode`)
+For best results with streaming sources:
+- Use the streaming timeout feature (enabled by default)
+- Or configure streaming connectors with bounded mode (`scan.bounded.mode`)
+- Or use bounded connectors (datagen with rows, filesystem, etc.)
 
 ### Test Tables
 
 The driver creates test tables for validation:
 
-| Table | Type | Rows | SQL Support |
-|-------|------|------|-------------|
-| users | Bounded | 10,000 | Full |
-| orders | Bounded | 50,000 | Full |
-| products | Bounded | 1,000 | Full |
-| page_views | Bounded | 100,000 | Full |
-| streaming_events | **Unbounded** | **Infinite** | **DO NOT QUERY** |
+| Table | Type | Rows | Queryable? |
+|-------|------|------|------------|
+| users | Bounded | 10,000 | ✅ Full SQL support |
+| orders | Bounded | 50,000 | ✅ Full SQL support |
+| products | Bounded | 1,000 | ✅ Full SQL support |
+| page_views | Bounded | 100,000 | ✅ Full SQL support |
+| streaming_events | Unbounded | Streaming | ✅ With timeout (partial results) |
 
-The `streaming_events` table exists to demonstrate the limitation. **Do not query it**.
+The `streaming_events` table demonstrates the streaming timeout feature - queries return partial results after the timeout!
 
 ## Supported Data Types
 

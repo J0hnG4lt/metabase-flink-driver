@@ -13,10 +13,24 @@
    [java.io PrintWriter]
    [java.sql Connection DriverManager ResultSet ResultSetMetaData Statement Types]
    [java.time LocalDate LocalDateTime LocalTime OffsetDateTime ZonedDateTime]
+   [java.util.concurrent Executors Future TimeUnit TimeoutException]
    [java.util.logging Logger]
    [javax.sql DataSource]))
 
 (set! *warn-on-reflection* true)
+
+;; ----------------------------------------
+;; Streaming Query Timeout Configuration
+;; ----------------------------------------
+
+;; Default timeout for streaming/unbounded queries (in seconds)
+;; This allows querying unbounded streaming tables by collecting partial results
+;; Set to 0 to disable timeout (queries will hang on unbounded tables)
+(def ^:private default-streaming-query-timeout-seconds 30)
+
+;; Thread-local storage for the current query timeout
+;; This is set per-connection and used by execute-statement!
+(def ^:private ^:dynamic *streaming-query-timeout* nil)
 
 ;; ----------------------------------------
 ;; JDBC Driver Loading
@@ -100,23 +114,29 @@
 ;; ----------------------------------------
 
 (defmethod sql-jdbc.conn/connection-details->spec :flink-sql
-  [_driver {:keys [host port catalog database additional-options] :as _details}]
+  [_driver {:keys [host port catalog database additional-options streaming-query-timeout] :as _details}]
   ;; Note: Flink JDBC URL format is jdbc:flink://host:port
   ;; Catalog and database are NOT supported in the URL path (unlike MySQL/Postgres)
   ;; Instead, we issue USE CATALOG and USE DATABASE statements after connecting
   (let [host           (or host "localhost")
         port           (or port 8083)
+        timeout        (if (some? streaming-query-timeout)
+                         streaming-query-timeout
+                         default-streaming-query-timeout-seconds)
         query-string   (when-not (str/blank? additional-options)
                          (str "?" additional-options))
         jdbc-url       (str "jdbc:flink://" host ":" port (or query-string ""))]
     (log/debug "Flink SQL JDBC URL:" jdbc-url)
     (log/debug "Flink catalog:" catalog "database:" database "(set via USE statements)")
+    (log/debug "Streaming query timeout:" timeout "seconds")
     {:classname   "org.apache.flink.table.jdbc.FlinkDriver"
      :subprotocol "flink"
      :subname     (str "//" host ":" port (or query-string ""))
      ;; Store catalog/database for use in initialize-session!
      :flink-catalog catalog
-     :flink-database database}))
+     :flink-database database
+     ;; Store streaming query timeout for execute-statement!
+     :flink-streaming-timeout timeout}))
 
 ;; Helper to extract catalog/database from various input types
 (defn- get-catalog-database
@@ -149,6 +169,35 @@
         {}))
 
     :else {}))
+
+;; Helper to extract streaming query timeout from various input types
+(defn- get-streaming-timeout
+  "Extract streaming query timeout from database spec or details.
+   Returns timeout in seconds, or default if not set."
+  [db-or-id-or-spec]
+  (cond
+    ;; Connection spec with flink-streaming-timeout key
+    (and (map? db-or-id-or-spec) (contains? db-or-id-or-spec :flink-streaming-timeout))
+    (:flink-streaming-timeout db-or-id-or-spec)
+
+    ;; Database map with details
+    (and (map? db-or-id-or-spec) (:details db-or-id-or-spec))
+    (let [details (:details db-or-id-or-spec)]
+      (or (:streaming-query-timeout details) default-streaming-query-timeout-seconds))
+
+    ;; Integer ID - lookup from Metabase DB
+    (integer? db-or-id-or-spec)
+    (try
+      (require 'metabase.lib.metadata.jvm)
+      (let [metadata-provider ((resolve 'metabase.lib.metadata.jvm/application-database-metadata-provider) db-or-id-or-spec)
+            db-info           ((resolve 'metabase.lib.metadata.protocols/database) metadata-provider)
+            details           (:details db-info)]
+        (or (:streaming-query-timeout details) default-streaming-query-timeout-seconds))
+      (catch Exception e
+        (log/debug "Could not get streaming timeout for DB ID" db-or-id-or-spec ":" (.getMessage e))
+        default-streaming-query-timeout-seconds))
+
+    :else default-streaming-query-timeout-seconds))
 
 ;; Helper to extract JDBC URL from database spec (used throughout driver)
 (defn- get-jdbc-url-from-db
@@ -688,15 +737,19 @@
   (let [jdbc-url    (get-jdbc-url-from-db db-or-id-or-spec)
         cat-db      (get-catalog-database db-or-id-or-spec)
         catalog     (:catalog cat-db)
-        database    (:database cat-db)]
+        database    (:database cat-db)
+        timeout     (get-streaming-timeout db-or-id-or-spec)]
     (log/debug "Opening direct Flink connection to:" jdbc-url "catalog:" catalog "database:" database)
+    (log/debug "Streaming query timeout:" timeout "seconds")
     (with-open [conn (get-flink-connection jdbc-url)]
       (try
         (.setAutoCommit conn true)
         (catch Exception _))
       ;; Initialize the session with default tables (and set catalog/database if specified)
       (initialize-session! conn catalog database)
-      (f conn))))
+      ;; Bind the streaming timeout for use in execute-statement!
+      (binding [*streaming-query-timeout* timeout]
+        (f conn)))))
 
 ;; NOTE: describe-database, describe-table, and describe-fields also use get-flink-connection
 ;; They are defined earlier in the file but will use the get-flink-connection defined at top
@@ -870,14 +923,258 @@
       ;; Metadata
       (getMetaData [] metadata))))
 
-;; Override execute-statement! to handle DDL statements
+;; ----------------------------------------
+;; Streaming Query Timeout Support
+;; ----------------------------------------
+
+;; These functions enable querying unbounded/streaming tables by:
+;; 1. Executing the query in a background thread
+;; 2. Collecting rows as they stream in
+;; 3. Returning partial results after timeout
+;; This allows Metabase users to query streaming sources like Kafka!
+
+(defn- extract-row-from-resultset
+  "Extract a single row from a ResultSet as a vector of values.
+   Returns nil if the ResultSet has no more rows."
+  [^ResultSet rs ^ResultSetMetaData metadata]
+  (let [col-count (.getColumnCount metadata)]
+    (mapv (fn [i] (.getObject rs ^int i)) (range 1 (inc col-count)))))
+
+(defn- collect-rows-with-timeout
+  "Collect rows from a ResultSet with a timeout.
+   Returns {:rows [...] :metadata ... :timed-out? bool :error ...}
+
+   The collection runs in a background thread. If timeout occurs:
+   - Returns whatever rows were collected
+   - Sets :timed-out? to true
+   - Attempts to cancel the statement"
+  [^ResultSet rs ^Statement stmt timeout-seconds]
+  (let [executor (Executors/newSingleThreadExecutor)
+        metadata (.getMetaData rs)
+        rows     (atom [])
+        start-time (System/currentTimeMillis)]
+    (try
+      (let [^Future future
+            (.submit executor
+                     ^Callable
+                     (fn []
+                       (try
+                         (while (.next rs)
+                           (swap! rows conj (extract-row-from-resultset rs metadata)))
+                         {:completed true}
+                         (catch Exception e
+                           {:error e}))))]
+        (try
+          ;; Wait for completion or timeout
+          (let [result (.get future timeout-seconds TimeUnit/SECONDS)]
+            {:rows       @rows
+             :metadata   metadata
+             :timed-out? false
+             :error      (:error result)})
+          (catch TimeoutException _
+            ;; Timeout occurred - cancel the future and statement
+            (log/info "Query timeout after" timeout-seconds "seconds, collected" (count @rows) "rows")
+            (.cancel future true)
+            (try
+              (.cancel stmt)
+              (log/debug "Statement cancelled successfully")
+              (catch Exception e
+                (log/debug "Failed to cancel statement:" (.getMessage e))))
+            {:rows       @rows
+             :metadata   metadata
+             :timed-out? true
+             :error      nil})
+          (catch Exception e
+            {:rows       @rows
+             :metadata   metadata
+             :timed-out? false
+             :error      e})))
+      (finally
+        (.shutdown executor)))))
+
+(defn- create-metadata-from-original
+  "Create a ResultSetMetaData wrapper from original metadata."
+  ^ResultSetMetaData [^ResultSetMetaData original]
+  (let [col-count (.getColumnCount original)
+        col-info  (mapv (fn [i]
+                          {:name      (.getColumnName original i)
+                           :label     (.getColumnLabel original i)
+                           :type      (.getColumnType original i)
+                           :type-name (.getColumnTypeName original i)
+                           :class     (.getColumnClassName original i)
+                           :nullable  (.isNullable original i)
+                           :precision (.getPrecision original i)
+                           :scale     (.getScale original i)})
+                        (range 1 (inc col-count)))]
+    (proxy [ResultSetMetaData] []
+      (getColumnCount [] col-count)
+      (getColumnName [col] (:name (nth col-info (dec col))))
+      (getColumnLabel [col] (:label (nth col-info (dec col))))
+      (getColumnType [col] (:type (nth col-info (dec col))))
+      (getColumnTypeName [col] (:type-name (nth col-info (dec col))))
+      (getColumnClassName [col] (:class (nth col-info (dec col))))
+      (isNullable [col] (:nullable (nth col-info (dec col))))
+      (getPrecision [col] (:precision (nth col-info (dec col))))
+      (getScale [col] (:scale (nth col-info (dec col))))
+      (getTableName [col] "")
+      (getSchemaName [col] "")
+      (getCatalogName [col] "")
+      (isAutoIncrement [col] false)
+      (isCaseSensitive [col] true)
+      (isSearchable [col] true)
+      (isCurrency [col] false)
+      (isSigned [col] false)
+      (isReadOnly [col] true)
+      (isWritable [col] false)
+      (isDefinitelyWritable [col] false)
+      (getColumnDisplaySize [col] 255))))
+
+(defn- create-resultset-from-rows
+  "Create a ResultSet from pre-collected rows.
+   This allows returning partial results from a timed-out query."
+  ^ResultSet [rows ^ResultSetMetaData metadata timed-out?]
+  (let [row-idx    (atom -1)
+        row-count  (count rows)
+        current-row (atom nil)
+        was-null   (atom false)
+        ;; Create a copy of metadata that doesn't depend on the original ResultSet
+        safe-metadata (create-metadata-from-original metadata)]
+    (proxy [ResultSet] []
+      ;; Navigation
+      (next []
+        (swap! row-idx inc)
+        (if (< @row-idx row-count)
+          (do
+            (reset! current-row (nth rows @row-idx))
+            true)
+          false))
+      (close [])
+      (isClosed [] false)
+      (isBeforeFirst [] (= @row-idx -1))
+      (isAfterLast [] (>= @row-idx row-count))
+      (isFirst [] (= @row-idx 0))
+      (isLast [] (= @row-idx (dec row-count)))
+      (getRow [] (if (>= @row-idx 0) (inc @row-idx) 0))
+
+      ;; Value getters - support both index (int) and name (String)
+      (getObject [col]
+        (let [idx (if (string? col)
+                    ;; Find column index by name
+                    (let [col-count (.getColumnCount safe-metadata)]
+                      (or (first (filter #(= col (.getColumnName safe-metadata %))
+                                        (range 1 (inc col-count))))
+                          1))
+                    col)
+              val (when @current-row (nth @current-row (dec idx) nil))]
+          (reset! was-null (nil? val))
+          val))
+
+      (getString [col]
+        (let [obj (.getObject this col)]
+          (when obj (str obj))))
+
+      (getInt [col]
+        (let [obj (.getObject this col)]
+          (if obj (int obj) 0)))
+
+      (getLong [col]
+        (let [obj (.getObject this col)]
+          (if obj (long obj) 0)))
+
+      (getDouble [col]
+        (let [obj (.getObject this col)]
+          (if obj (double obj) 0.0)))
+
+      (getFloat [col]
+        (let [obj (.getObject this col)]
+          (if obj (float obj) (float 0.0))))
+
+      (getBoolean [col]
+        (let [obj (.getObject this col)]
+          (boolean obj)))
+
+      (getBigDecimal [col]
+        (let [obj (.getObject this col)]
+          (when obj
+            (if (instance? java.math.BigDecimal obj)
+              obj
+              (java.math.BigDecimal. (str obj))))))
+
+      (getDate [col]
+        (let [obj (.getObject this col)]
+          (when obj
+            (if (instance? java.sql.Date obj)
+              obj
+              (java.sql.Date/valueOf (str obj))))))
+
+      (getTime [col]
+        (let [obj (.getObject this col)]
+          (when obj
+            (if (instance? java.sql.Time obj)
+              obj
+              (java.sql.Time/valueOf (str obj))))))
+
+      (getTimestamp [col]
+        (let [obj (.getObject this col)]
+          (when obj
+            (cond
+              (instance? java.sql.Timestamp obj) obj
+              (instance? java.time.LocalDateTime obj)
+              (java.sql.Timestamp/valueOf ^java.time.LocalDateTime obj)
+              :else (java.sql.Timestamp/valueOf (str obj))))))
+
+      (getBytes [col] nil)
+      (getArray [col] nil)
+
+      (wasNull [] @was-null)
+
+      ;; Metadata
+      (getMetaData [] safe-metadata))))
+
+(defn- execute-with-streaming-timeout
+  "Execute a query with streaming timeout support.
+   If timeout > 0 and the query doesn't complete in time:
+   - Returns partial results collected before timeout
+   - Logs a warning about the timeout
+
+   This enables querying unbounded streaming tables!"
+  [^Statement stmt ^String sql timeout-seconds]
+  (log/info "Executing query with" timeout-seconds "second streaming timeout")
+  (if (or (nil? timeout-seconds) (<= timeout-seconds 0))
+    ;; No timeout - execute normally (will hang on unbounded tables!)
+    (do
+      (log/debug "No streaming timeout configured - executing without timeout")
+      (.execute stmt sql)
+      (.getResultSet stmt))
+    ;; With timeout - collect rows in background
+    (do
+      (.execute stmt sql)
+      (let [rs (.getResultSet stmt)]
+        (if rs
+          (let [{:keys [rows metadata timed-out? error]}
+                (collect-rows-with-timeout rs stmt timeout-seconds)]
+            (when error
+              (log/warn "Error during row collection:" error))
+            (when timed-out?
+              (log/warn "Query timed out after" timeout-seconds "seconds."
+                        "Returning" (count rows) "partial results."
+                        "This may indicate an unbounded streaming table."))
+            ;; Return a ResultSet backed by collected rows
+            (create-resultset-from-rows rows metadata timed-out?))
+          ;; No result set (shouldn't happen for SELECT)
+          nil)))))
+
+;; Override execute-statement! to handle DDL statements and streaming timeout
 ;; For native queries, sql-jdbc calls execute-statement! which expects a ResultSet
 ;; DDL statements (CREATE, DROP, ALTER) don't return result sets, so we handle them specially
+;; Regular queries use streaming timeout to support unbounded tables
 (defmethod sql-jdbc.execute/execute-statement! :flink-sql
   [driver ^Statement stmt ^String sql]
   ;; Strip any Metabase comments to check for DDL and execute clean SQL
-  (let [clean-sql (strip-sql-comments sql)]
+  (let [clean-sql (strip-sql-comments sql)
+        timeout   (or *streaming-query-timeout* default-streaming-query-timeout-seconds)]
     (log/info "execute-statement! called with SQL:" (subs clean-sql 0 (min 80 (count clean-sql))))
+    (log/debug "Streaming query timeout:" timeout "seconds")
     (if (ddl-statement? clean-sql)
       ;; DDL statement - execute without expecting a ResultSet
       (do
@@ -887,8 +1184,7 @@
         (log/info "DDL executed successfully")
         ;; Return a mock ResultSet with "OK" result
         (create-ddl-result-set))
-      ;; Regular query - use standard execute
+      ;; Regular query - use streaming timeout to support unbounded tables
       (do
-        (log/info "Executing regular query via execute-statement!")
-        (.execute stmt clean-sql)
-        (.getResultSet stmt)))))
+        (log/info "Executing regular query via execute-statement! with streaming timeout")
+        (execute-with-streaming-timeout stmt clean-sql timeout)))))
