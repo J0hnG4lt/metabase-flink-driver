@@ -402,4 +402,10 @@ MIT License - see LICENSE file for details.
 
 ## Acknowledgments
 
-Based on the [metabase-flightsql-driver](https://github.com/J0hnG4lt/metabase-flightsql-driver) architecture.
+This driver was developed with significant assistance from [Claude Code](https://claude.ai/claude-code), Anthropic's AI coding assistant. The author is not a Clojure developer, but Claude helped with the Clojure implementation, Metabase driver architecture, and debugging.
+
+We welcome contributions from the community! If you're a Clojure developer or have experience with Metabase drivers, your help would be greatly appreciated.
+
+## Contact
+
+For inquiries or assistance, please open an issue in this repository or reach out directly to the maintainer at georvic.tur@gmail.com.
