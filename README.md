@@ -105,9 +105,88 @@ Before using this driver, ensure your Flink cluster has the SQL Gateway running:
 | Table sync | Yes |
 | Query builder | Yes |
 | Native queries | Yes |
+| JOINs | Yes |
+| Aggregations (GROUP BY, SUM, COUNT) | Yes |
+| Subqueries | Yes |
+| Large result sets (100K+ rows) | Yes |
 | Foreign keys | No |
 | Timezone conversion | No |
 | Connection impersonation | No |
+
+## Supported Table Types and Streaming Limitation
+
+### How Flink JDBC Works
+
+The Flink JDBC driver operates in **batch mode only** (per [FLIP-293](https://cwiki.apache.org/confluence/display/FLINK/FLIP-293%3A+Introduce+Flink+JDBC+Driver)). This means:
+- Queries must return **finite result sets**
+- **Unbounded streaming tables** will hang forever
+- This is by design, not a driver bug
+
+### Supported Connectors
+
+| Connector | Configuration | Works? | Notes |
+|-----------|--------------|--------|-------|
+| `datagen` with rows | `'number-of-rows' = '10000'` | Yes | Finite data, full SQL support |
+| `datagen` without rows | No `number-of-rows` | **No** | Unbounded stream, queries hang |
+| `filesystem` | CSV, Parquet files | Yes | Bounded by file content |
+| `jdbc` | External database | Yes | Bounded by source query |
+| `kafka` unbounded | No bounded mode | **No** | Infinite stream, queries hang |
+| `kafka` bounded | `'scan.bounded.mode' = 'latest-offset'` | Yes | Treats stream as snapshot |
+
+### Querying Kafka Tables
+
+To query Kafka tables via JDBC/Metabase, configure them with a bounded scan mode:
+
+```sql
+CREATE TABLE kafka_events (
+  event_id STRING,
+  event_data STRING,
+  event_time TIMESTAMP(3),
+  WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'events',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'scan.startup.mode' = 'earliest-offset',
+  'scan.bounded.mode' = 'latest-offset',  -- THIS IS KEY!
+  'format' = 'json'
+);
+```
+
+#### Bounded Mode Options
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `latest-offset` | Read up to latest offset at query time | Snapshot of current data |
+| `timestamp` | Read up to specific timestamp | Historical queries |
+| `specific-offsets` | Read to specific partition offsets | Precise boundaries |
+| `group-offsets` | Bounded by consumer group commits | Resume from checkpoint |
+
+### Why Unbounded Tables Hang
+
+When you query an unbounded table (streaming source without bounds):
+1. Flink starts reading from the source
+2. JDBC waits for the query to "complete"
+3. An unbounded stream **never completes**
+4. The query hangs forever
+
+This is expected behavior. To fix it, either:
+- Use bounded connectors (datagen with rows, filesystem, etc.)
+- Configure streaming connectors with bounded mode (`scan.bounded.mode`)
+
+### Test Tables
+
+The driver creates test tables for validation:
+
+| Table | Type | Rows | SQL Support |
+|-------|------|------|-------------|
+| users | Bounded | 10,000 | Full |
+| orders | Bounded | 50,000 | Full |
+| products | Bounded | 1,000 | Full |
+| page_views | Bounded | 100,000 | Full |
+| streaming_events | **Unbounded** | **Infinite** | **DO NOT QUERY** |
+
+The `streaming_events` table exists to demonstrate the limitation. **Do not query it**.
 
 ## Supported Data Types
 

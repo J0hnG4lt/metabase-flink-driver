@@ -347,36 +347,100 @@ def main():
         print("No tables discovered yet. You may need to wait for the sync to complete.")
         sys.exit(1)
 
-    # Test queries
-    print("\n--- Testing Queries ---")
+    # Test queries - comprehensive tests for bounded tables
+    print("\n--- Testing Bounded Table Queries ---")
+    print("These tests prove full SQL support on bounded tables (10K+ rows)")
+
     test_queries = [
-        ("SELECT COUNT(*) as cnt FROM users", "User count"),
-        ("SELECT * FROM orders LIMIT 3", "Orders sample"),
-        ("SELECT COUNT(*) as cnt FROM products", "Product count"),
+        # Basic counts - verify large table sizes
+        ("SELECT COUNT(*) as cnt FROM users", "User count (expect 10,000)"),
+        ("SELECT COUNT(*) as cnt FROM orders", "Order count (expect 50,000)"),
+        ("SELECT COUNT(*) as cnt FROM products", "Product count (expect 1,000)"),
+        ("SELECT COUNT(*) as cnt FROM page_views", "Page views count (expect 100,000)"),
+
+        # Large result set - no arbitrary LIMIT
+        ("SELECT * FROM users", "All users (10,000 rows - no LIMIT!)"),
+
+        # Complex WHERE clauses
+        ("SELECT * FROM users WHERE age >= 30 AND age <= 50", "Users age 30-50 (WHERE)"),
+        ("SELECT * FROM orders WHERE quantity > 5", "High quantity orders (WHERE)"),
+
+        # Aggregations with GROUP BY
+        ("SELECT country, COUNT(*) as cnt FROM users GROUP BY country", "Users by country (GROUP BY)"),
+        ("SELECT status, SUM(quantity) as total_qty FROM orders GROUP BY status", "Orders by status (SUM + GROUP BY)"),
+
+        # JOINs - proves JOIN support
+        ("SELECT u.username, COUNT(o.order_id) as order_count FROM users u LEFT JOIN orders o ON u.user_id = o.user_id GROUP BY u.username LIMIT 100", "User order counts (JOIN)"),
+
+        # Subqueries
+        ("SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products)", "Above avg price products (SUBQUERY)"),
+
+        # LIMIT with OFFSET (pagination)
+        ("SELECT * FROM users ORDER BY user_id LIMIT 10 OFFSET 100", "Users page 11 (LIMIT + OFFSET)"),
     ]
 
     all_passed = True
     for query, description in test_queries:
         print(f"\nTest: {description}")
-        print(f"Query: {query}")
+        print(f"Query: {query[:80]}{'...' if len(query) > 80 else ''}")
         result = setup.run_query(db_id, query)
         if result.get("status") == "completed":
             rows = result.get("data", {}).get("rows", [])
             print(f"Result: SUCCESS - {len(rows)} rows returned")
-            if rows:
-                print(f"First row: {rows[0]}")
+            if rows and len(rows) <= 5:
+                for row in rows:
+                    print(f"  {row}")
         else:
             error = result.get("error", "Unknown error")
             print(f"Result: FAILED - {str(error)[:200]}")
             all_passed = False
 
+    # Document the streaming table limitation
     print("\n" + "=" * 50)
-    print("Setup complete!")
+    print("STREAMING TABLE LIMITATION")
+    print("=" * 50)
+    print("""
+The 'streaming_events' table is an UNBOUNDED streaming source.
+It uses datagen connector WITHOUT 'number-of-rows' setting.
+
+IMPORTANT: DO NOT query this table via JDBC/Metabase!
+- Queries will hang forever waiting for the stream to "end"
+- This is a Flink JDBC limitation (FLIP-293: batch mode only)
+
+To work with streaming sources like Kafka, configure them with:
+  'scan.bounded.mode' = 'latest-offset'
+
+This makes the stream queryable by treating current data as bounded.
+""")
+
+    print("\n" + "=" * 50)
+    print("SETUP SUMMARY")
+    print("=" * 50)
     print(f"Metabase URL: http://{args.host}:{args.port}")
     print(f"Login: {args.admin_email} / {args.admin_password}")
     print(f"Database ID: {db_id}")
-    print(f"Tables: {len(tables)}")
-    print(f"Query Tests: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
+    print(f"\nTables ({len(tables)} total):")
+
+    # Group tables by type
+    bounded_tables = []
+    streaming_tables = []
+    for table in tables:
+        name = table.get('name')
+        fields = len(table.get('fields', []))
+        if name == 'streaming_events':
+            streaming_tables.append((name, fields))
+        else:
+            bounded_tables.append((name, fields))
+
+    print("\nBounded (queryable):")
+    for name, fields in bounded_tables:
+        print(f"  - {name}: {fields} fields")
+
+    print("\nUnbounded (DO NOT QUERY):")
+    for name, fields in streaming_tables:
+        print(f"  - {name}: {fields} fields [WARNING: WILL HANG!]")
+
+    print(f"\nQuery Tests: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
     print("=" * 50)
 
     if not all_passed:

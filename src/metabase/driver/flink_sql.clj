@@ -447,9 +447,23 @@
 ;; ----------------------------------------
 
 ;; Default SQL to create tables in each session (for testing)
-;; These tables use the datagen connector with bounded rows for batch queries
+;; These tables use the datagen connector with bounded rows for batch queries.
+;;
+;; IMPORTANT: Tables MUST have 'number-of-rows' set for JDBC queries to work.
+;; Without it, the table becomes an unbounded stream and queries will hang forever.
+;; This is a Flink JDBC limitation (FLIP-293: JDBC only supports batch mode).
+;;
+;; Table Types:
+;; - BOUNDED (queryable): datagen with 'number-of-rows', filesystem, JDBC sources
+;; - UNBOUNDED (hangs): datagen without row limit, Kafka without bounded mode
+;; - STREAMING WITH BOUNDS: Kafka with 'scan.bounded.mode' = 'latest-offset'
 (def ^:private default-init-sql
-  ["CREATE TABLE IF NOT EXISTS users (
+  [;; =====================================================
+   ;; BOUNDED TABLES (10K+ rows) - Full SQL support
+   ;; =====================================================
+
+   ;; Users table - 10,000 rows for testing large result sets
+   "CREATE TABLE IF NOT EXISTS users (
       user_id INT,
       username STRING,
       email STRING,
@@ -458,16 +472,18 @@
       country STRING
     ) WITH (
       'connector' = 'datagen',
-      'number-of-rows' = '100',
+      'number-of-rows' = '10000',
       'fields.user_id.kind' = 'sequence',
       'fields.user_id.start' = '1',
-      'fields.user_id.end' = '100',
+      'fields.user_id.end' = '10000',
       'fields.username.length' = '10',
       'fields.email.length' = '15',
       'fields.age.min' = '18',
       'fields.age.max' = '80',
       'fields.country.length' = '5'
     )"
+
+   ;; Orders table - 50,000 rows for JOIN and aggregation testing
    "CREATE TABLE IF NOT EXISTS orders (
       order_id INT,
       user_id INT,
@@ -478,12 +494,12 @@
       status STRING
     ) WITH (
       'connector' = 'datagen',
-      'number-of-rows' = '500',
+      'number-of-rows' = '50000',
       'fields.order_id.kind' = 'sequence',
       'fields.order_id.start' = '1',
-      'fields.order_id.end' = '500',
+      'fields.order_id.end' = '50000',
       'fields.user_id.min' = '1',
-      'fields.user_id.max' = '100',
+      'fields.user_id.max' = '10000',
       'fields.product_name.length' = '12',
       'fields.quantity.min' = '1',
       'fields.quantity.max' = '10',
@@ -491,6 +507,8 @@
       'fields.unit_price.max' = '500',
       'fields.status.length' = '8'
     )"
+
+   ;; Products table - 1,000 rows for product catalog
    "CREATE TABLE IF NOT EXISTS products (
       product_id INT,
       product_name STRING,
@@ -500,10 +518,10 @@
       last_updated TIMESTAMP(3)
     ) WITH (
       'connector' = 'datagen',
-      'number-of-rows' = '50',
+      'number-of-rows' = '1000',
       'fields.product_id.kind' = 'sequence',
       'fields.product_id.start' = '1',
-      'fields.product_id.end' = '50',
+      'fields.product_id.end' = '1000',
       'fields.product_name.length' = '15',
       'fields.category.length' = '8',
       'fields.price.min' = '5',
@@ -511,6 +529,8 @@
       'fields.stock_quantity.min' = '0',
       'fields.stock_quantity.max' = '500'
     )"
+
+   ;; Page views table - 100,000 rows for analytics testing
    "CREATE TABLE IF NOT EXISTS page_views (
       view_id BIGINT,
       user_id INT,
@@ -521,16 +541,40 @@
       device_type STRING
     ) WITH (
       'connector' = 'datagen',
-      'number-of-rows' = '1000',
+      'number-of-rows' = '100000',
       'fields.view_id.kind' = 'sequence',
       'fields.view_id.start' = '1',
-      'fields.view_id.end' = '1000',
+      'fields.view_id.end' = '100000',
       'fields.user_id.min' = '1',
-      'fields.user_id.max' = '100',
+      'fields.user_id.max' = '10000',
       'fields.page_url.length' = '20',
       'fields.referrer.length' = '15',
       'fields.session_id.length' = '32',
       'fields.device_type.length' = '6'
+    )"
+
+   ;; =====================================================
+   ;; UNBOUNDED STREAMING TABLE - Queries will HANG!
+   ;; This demonstrates the Flink JDBC batch-mode limitation.
+   ;; DO NOT query this table - it's here to show what NOT to do.
+   ;; =====================================================
+
+   ;; Streaming events - NO number-of-rows = UNBOUNDED STREAM
+   ;; WARNING: Any query on this table will hang forever!
+   "CREATE TABLE IF NOT EXISTS streaming_events (
+      event_id INT,
+      event_type STRING,
+      event_data STRING,
+      event_time TIMESTAMP(3),
+      WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+    ) WITH (
+      'connector' = 'datagen',
+      'rows-per-second' = '10',
+      'fields.event_id.kind' = 'random',
+      'fields.event_id.min' = '1',
+      'fields.event_id.max' = '1000000',
+      'fields.event_type.length' = '10',
+      'fields.event_data.length' = '50'
     )"])
 
 (defn- initialize-session!

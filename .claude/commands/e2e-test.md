@@ -115,11 +115,36 @@ print(f'Rows: {len(d.get(\"data\",{}).get(\"rows\",[]))}')
 
 | Check | Expected |
 |-------|----------|
-| Tables synced | 4 (users, orders, products, page_views) |
-| Fields per table | users: 6, orders: 7, products: 6, page_views: 7 |
-| Query status | `completed` |
-| Query rows | 5 (for LIMIT 5) |
+| Tables synced | 5 (users, orders, products, page_views, streaming_events) |
+| Fields per table | users: 6, orders: 7, products: 6, page_views: 7, streaming_events: 4 |
+| User count | 10,000 |
+| Order count | 50,000 |
+| Product count | 1,000 |
+| Page views count | 100,000 |
 | Connection test | Passes |
+| All bounded queries | Pass |
+
+## Table Types
+
+| Table | Type | Rows | Notes |
+|-------|------|------|-------|
+| users | Bounded | 10,000 | Full SQL support |
+| orders | Bounded | 50,000 | Full SQL support |
+| products | Bounded | 1,000 | Full SQL support |
+| page_views | Bounded | 100,000 | Full SQL support |
+| streaming_events | **UNBOUNDED** | ∞ | ⚠️ DO NOT QUERY - will hang! |
+
+## Streaming Table Limitation
+
+The `streaming_events` table demonstrates the Flink JDBC batch-mode limitation:
+- It uses `datagen` connector WITHOUT `number-of-rows`
+- Any query will hang forever waiting for the stream to end
+- This is expected behavior per FLIP-293
+
+**To query streaming sources like Kafka**, configure them with:
+```sql
+'scan.bounded.mode' = 'latest-offset'
+```
 
 ## Troubleshooting
 
