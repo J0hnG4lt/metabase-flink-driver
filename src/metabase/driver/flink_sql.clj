@@ -11,12 +11,39 @@
    [metabase.util.log :as log])
   (:import
    [java.io PrintWriter]
-   [java.sql Connection DriverManager ResultSet Statement Types]
+   [java.sql Connection DriverManager ResultSet ResultSetMetaData Statement Types]
    [java.time LocalDate LocalDateTime LocalTime OffsetDateTime ZonedDateTime]
    [java.util.logging Logger]
    [javax.sql DataSource]))
 
 (set! *warn-on-reflection* true)
+
+;; ----------------------------------------
+;; JDBC Driver Loading
+;; ----------------------------------------
+
+;; Ensure Flink JDBC driver is loaded - must be called before DriverManager.getConnection()
+;; This is defined early because it's needed by can-connect? and other methods
+(defonce ^:private flink-driver-loaded
+  (try
+    (Class/forName "org.apache.flink.table.jdbc.FlinkDriver")
+    (log/info "Flink JDBC driver loaded successfully")
+    true
+    (catch ClassNotFoundException e
+      (log/error e "Failed to load Flink JDBC driver - connection will fail")
+      false)))
+
+(defn- ensure-flink-driver!
+  "Ensure Flink JDBC driver is loaded. Throws if not available."
+  []
+  (when-not flink-driver-loaded
+    (throw (Exception. "Flink JDBC driver not loaded - check plugin JAR contains Flink dependencies"))))
+
+(defn- get-flink-connection
+  "Get a Flink JDBC connection after ensuring the driver is loaded."
+  ^Connection [^String jdbc-url]
+  (ensure-flink-driver!)
+  (DriverManager/getConnection jdbc-url))
 
 ;; ----------------------------------------
 ;; Simple DataSource (bypasses c3p0 pooling)
@@ -29,9 +56,9 @@
   ^DataSource [jdbc-url]
   (reify DataSource
     (getConnection [_]
-      (DriverManager/getConnection jdbc-url))
+      (get-flink-connection jdbc-url))
     (getConnection [_ _user _password]
-      (DriverManager/getConnection jdbc-url))
+      (get-flink-connection jdbc-url))
     (getLoginTimeout [_] 0)
     (setLoginTimeout [_ _seconds])
     (getLogWriter [_] nil)
@@ -180,12 +207,12 @@
 
 (defmethod driver/can-connect? :flink-sql
   [driver details]
-  (let [spec (sql-jdbc.conn/connection-details->spec driver details)]
+  (let [spec (sql-jdbc.conn/connection-details->spec driver details)
+        jdbc-url (str "jdbc:" (:subprotocol spec) ":" (:subname spec))]
     (try
       ;; Flink JDBC doesn't support prepareStatement
       ;; Use execute() + getResultSet() for catalog operations which are fast
-      (with-open [conn (java.sql.DriverManager/getConnection
-                        (str "jdbc:" (:subprotocol spec) ":" (:subname spec)))]
+      (with-open [conn (get-flink-connection jdbc-url)]
         (with-open [stmt (.createStatement conn)]
           (let [has-rs (.execute stmt "SHOW CATALOGS")]
             (if has-rs
@@ -267,7 +294,7 @@
   [_driver database]
   (let [jdbc-url (get-jdbc-url-from-db database)]
     (try
-      (with-open [conn (DriverManager/getConnection jdbc-url)]
+      (with-open [conn (get-flink-connection jdbc-url)]
         ;; Initialize session with tables before describing
         (initialize-session! conn)
         (with-open [stmt (.createStatement conn)]
@@ -290,7 +317,7 @@
   (let [jdbc-url   (get-jdbc-url-from-db database)
         table-name (:name table)]
     (try
-      (with-open [conn (DriverManager/getConnection jdbc-url)]
+      (with-open [conn (get-flink-connection jdbc-url)]
         ;; Initialize session with tables before describing
         (initialize-session! conn)
         (with-open [stmt (.createStatement conn)]
@@ -332,7 +359,7 @@
     (reify clojure.lang.IReduceInit
       (reduce [_ rf init]
         (try
-          (with-open [conn (DriverManager/getConnection jdbc-url)]
+          (with-open [conn (get-flink-connection jdbc-url)]
             ;; Initialize session with tables
             (initialize-session! conn)
             ;; Get list of tables to describe
@@ -601,13 +628,16 @@
   ;; Bypass c3p0 pooling - Flink JDBC doesn't support clearWarnings() and other operations
   (let [jdbc-url (get-jdbc-url-from-db db-or-id-or-spec)]
     (log/debug "Opening direct Flink connection to:" jdbc-url)
-    (with-open [conn (DriverManager/getConnection jdbc-url)]
+    (with-open [conn (get-flink-connection jdbc-url)]
       (try
         (.setAutoCommit conn true)
         (catch Exception _))
       ;; Initialize the session with default tables
       (initialize-session! conn)
       (f conn))))
+
+;; NOTE: describe-database, describe-table, and describe-fields also use get-flink-connection
+;; They are defined earlier in the file but will use the get-flink-connection defined at top
 
 ;; ----------------------------------------
 ;; Statement Creation Workaround
@@ -667,3 +697,136 @@
   ;; Flink only supports the no-args version of createStatement()
   ;; Wrap it to handle unsupported operations gracefully
   (wrap-flink-statement (.createStatement conn)))
+
+;; ----------------------------------------
+;; DDL Statement Support
+;; ----------------------------------------
+
+(defn- strip-sql-comments
+  "Remove SQL comments from the beginning of a query.
+   Metabase prepends comments like '-- Metabase::...' to native queries."
+  [^String sql]
+  (when sql
+    ;; Remove single-line comments at the start
+    (loop [s (str/trim sql)]
+      (cond
+        ;; Single-line comment: -- ...
+        (str/starts-with? s "--")
+        (let [newline-idx (str/index-of s "\n")]
+          (if newline-idx
+            (recur (str/trim (subs s (inc newline-idx))))
+            ""))  ;; No newline, entire string is a comment
+
+        ;; Multi-line comment: /* ... */
+        (str/starts-with? s "/*")
+        (let [end-idx (str/index-of s "*/")]
+          (if end-idx
+            (recur (str/trim (subs s (+ end-idx 2))))
+            ""))  ;; Unclosed comment
+
+        :else s))))
+
+(defn- ddl-statement?
+  "Check if SQL is a DDL statement (CREATE, DROP, ALTER, etc.)
+   These need special handling as they don't return result sets.
+   Handles Metabase comment prefix (-- Metabase::...) by stripping comments first."
+  [^String sql]
+  (when sql
+    (let [;; Strip any leading comments (Metabase adds '-- Metabase::...' prefix)
+          clean-sql (strip-sql-comments sql)
+          trimmed   (-> clean-sql str/upper-case)]
+      (or (str/starts-with? trimmed "CREATE ")
+          (str/starts-with? trimmed "DROP ")
+          (str/starts-with? trimmed "ALTER ")
+          (str/starts-with? trimmed "TRUNCATE ")
+          (str/starts-with? trimmed "USE ")
+          (str/starts-with? trimmed "SET ")))))
+
+;; Create a mock ResultSetMetaData for DDL responses
+(defn- create-ddl-metadata
+  "Create a mock ResultSetMetaData that describes a single 'result' column."
+  ^ResultSetMetaData []
+  (proxy [ResultSetMetaData] []
+    (getColumnCount [] 1)
+    (getColumnName [col] "result")
+    (getColumnLabel [col] "result")
+    (getColumnType [col] Types/VARCHAR)
+    (getColumnTypeName [col] "VARCHAR")
+    (getColumnClassName [col] "java.lang.String")
+    (isNullable [col] ResultSetMetaData/columnNoNulls)
+    (getPrecision [col] 0)
+    (getScale [col] 0)
+    (getTableName [col] "")
+    (getSchemaName [col] "")
+    (getCatalogName [col] "")
+    (isAutoIncrement [col] false)
+    (isCaseSensitive [col] true)
+    (isSearchable [col] true)
+    (isCurrency [col] false)
+    (isSigned [col] false)
+    (isReadOnly [col] true)
+    (isWritable [col] false)
+    (isDefinitelyWritable [col] false)
+    (getColumnDisplaySize [col] 10)))
+
+;; Create a mock ResultSet for DDL responses
+;; This returns a single row with "OK" result
+;; Using proxy instead of reify to handle overloaded methods
+(defn- create-ddl-result-set
+  "Create a mock ResultSet that returns a single 'OK' row for DDL statements."
+  ^ResultSet []
+  (let [row-returned (atom false)
+        metadata     (create-ddl-metadata)]
+    (proxy [ResultSet] []
+      ;; Core navigation methods
+      (next []
+        (if @row-returned
+          false
+          (do (reset! row-returned true) true)))
+      (close [])
+      (isClosed [] false)
+
+      ;; Column value getters - all return "OK" or appropriate defaults
+      ;; proxy handles both int and String overloads
+      (getString [col] "OK")
+      (getObject [col] "OK")
+      (getInt [col] 0)
+      (getLong [col] 0)
+      (getBoolean [col] true)
+      (getDouble [col] 0.0)
+      (getFloat [col] (float 0.0))
+      (getBigDecimal [col] (BigDecimal. 0))
+      (getDate [col] nil)
+      (getTime [col] nil)
+      (getTimestamp [col] nil)
+      (getBytes [col] nil)
+      (getArray [col] nil)
+
+      ;; wasNull - always false since we have a value
+      (wasNull [] false)
+
+      ;; Metadata
+      (getMetaData [] metadata))))
+
+;; Override execute-statement! to handle DDL statements
+;; For native queries, sql-jdbc calls execute-statement! which expects a ResultSet
+;; DDL statements (CREATE, DROP, ALTER) don't return result sets, so we handle them specially
+(defmethod sql-jdbc.execute/execute-statement! :flink-sql
+  [driver ^Statement stmt ^String sql]
+  ;; Strip any Metabase comments to check for DDL and execute clean SQL
+  (let [clean-sql (strip-sql-comments sql)]
+    (log/info "execute-statement! called with SQL:" (subs clean-sql 0 (min 80 (count clean-sql))))
+    (if (ddl-statement? clean-sql)
+      ;; DDL statement - execute without expecting a ResultSet
+      (do
+        (log/info "Executing DDL statement via execute-statement!:" (subs clean-sql 0 (min 100 (count clean-sql))))
+        ;; Use .execute() for DDL - it works unlike .executeUpdate() in Flink JDBC
+        (.execute stmt clean-sql)
+        (log/info "DDL executed successfully")
+        ;; Return a mock ResultSet with "OK" result
+        (create-ddl-result-set))
+      ;; Regular query - use standard execute
+      (do
+        (log/info "Executing regular query via execute-statement!")
+        (.execute stmt clean-sql)
+        (.getResultSet stmt)))))

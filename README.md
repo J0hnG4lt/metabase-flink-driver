@@ -105,6 +105,7 @@ Before using this driver, ensure your Flink cluster has the SQL Gateway running:
 | Table sync | Yes |
 | Query builder | Yes |
 | Native queries | Yes |
+| DDL statements (CREATE, DROP, ALTER) | Yes* |
 | JOINs | Yes |
 | Aggregations (GROUP BY, SUM, COUNT) | Yes |
 | Subqueries | Yes |
@@ -112,6 +113,8 @@ Before using this driver, ensure your Flink cluster has the SQL Gateway running:
 | Foreign keys | No |
 | Timezone conversion | No |
 | Connection impersonation | No |
+
+*DDL statements work but tables are session-scoped (see DDL Support section below)
 
 ## Supported Table Types and Streaming Limitation
 
@@ -204,6 +207,50 @@ The `streaming_events` table exists to demonstrate the limitation. **Do not quer
 | TIMESTAMP_LTZ | DateTimeWithLocalTZ |
 | ARRAY | Array |
 | MAP, ROW | Structured |
+
+## DDL Support (CREATE TABLE, DROP TABLE, etc.)
+
+This driver supports DDL statements via native queries in Metabase:
+
+```sql
+-- Create a bounded datagen table
+CREATE TABLE my_table (
+  id INT,
+  name STRING
+) WITH (
+  'connector' = 'datagen',
+  'number-of-rows' = '1000'
+);
+
+-- Drop a table
+DROP TABLE my_table;
+
+-- Alter table (if supported by the connector)
+ALTER TABLE my_table ADD new_column STRING;
+```
+
+### Session Scope Limitation
+
+**Important**: Tables created via DDL are **session-scoped** in Flink. Each Metabase query runs in a separate JDBC session, meaning:
+
+- Tables created in one query are NOT visible to subsequent queries
+- This is standard Flink behavior, not a driver limitation
+- The built-in test tables (users, orders, products, page_views) are re-created in each session automatically
+
+### Persisting Tables to a Catalog
+
+To create tables that persist across sessions, you must:
+
+1. Configure a persistent catalog (Hive, JDBC, etc.) in your Flink cluster
+2. Use the catalog in your DDL statements
+
+```sql
+-- Example with Hive catalog
+USE CATALOG hive_catalog;
+CREATE TABLE persistent_table (...) WITH (...);
+```
+
+See the [Flink Catalogs documentation](https://nightlies.apache.org/flink/flink-docs-master/docs/dev/table/catalogs/) for more information.
 
 ## Development
 
