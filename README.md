@@ -11,9 +11,9 @@ This driver allows Metabase to connect to Apache Flink SQL Gateway, enabling you
 
 ## Requirements
 
-- Metabase v0.50+
-- Apache Flink 1.18+ with SQL Gateway enabled
-- Java 11+
+- Metabase v0.50+ (tested with v0.57.7)
+- Apache Flink 2.0+ with SQL Gateway enabled (tested with 2.1.1)
+- Java 17+ (Java 21 also supported)
 
 ## Installation
 

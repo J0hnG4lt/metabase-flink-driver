@@ -23,7 +23,7 @@ services:
   # Flink JobManager
   # ----------------------------------------
   jobmanager:
-    image: flink:1.20-java17
+    image: flink:2.1.1-java17
     ports:
       - "8081:8081"   # Flink Web UI
     command: jobmanager
@@ -49,7 +49,7 @@ services:
   # Flink TaskManager
   # ----------------------------------------
   taskmanager:
-    image: flink:1.20-java17
+    image: flink:2.1.1-java17
     depends_on:
       jobmanager:
         condition: service_healthy
@@ -73,7 +73,7 @@ services:
   # Flink SQL Gateway
   # ----------------------------------------
   sql-gateway:
-    image: flink:1.20-java17
+    image: flink:2.1.1-java17
     depends_on:
       jobmanager:
         condition: service_healthy
@@ -134,7 +134,7 @@ services:
       - flink-net
 
   metabase:
-    image: metabase/metabase:v0.52.5
+    image: metabase/metabase:v0.57.7
     depends_on:
       postgres:
         condition: service_healthy

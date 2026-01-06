@@ -406,7 +406,7 @@ def main():
         ("""CREATE TABLE IF NOT EXISTS ddl_test_table (
             id INT,
             name STRING,
-            value DOUBLE
+            amount DOUBLE
         ) WITH (
             'connector' = 'datagen',
             'number-of-rows' = '50',

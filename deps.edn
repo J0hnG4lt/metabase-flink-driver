@@ -1,7 +1,7 @@
 {:paths ["src" "resources"]
 
  :deps {org.clojure/clojure {:mvn/version "1.11.1"}
-        org.apache.flink/flink-sql-jdbc-driver-bundle {:mvn/version "1.20.0"}}
+        org.apache.flink/flink-sql-jdbc-driver-bundle {:mvn/version "2.1.1"}}
 
  :aliases
  {:test {:extra-paths ["test"]
