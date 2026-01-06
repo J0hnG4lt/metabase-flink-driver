@@ -36,7 +36,7 @@ jobs:
     - name: Build driver JAR
       run: |
         echo "Building Metabase Flink SQL Driver..."
-        clj -T:build uber
+        clojure -T:build uber
         echo "Build complete!"
         ls -la target/*.jar
 
