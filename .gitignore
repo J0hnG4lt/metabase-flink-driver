@@ -19,6 +19,6 @@ Thumbs.db
 /data/*.parquet
 *.log
 
-# Claude
-.claude/
+# Claude (keep .claude/commands for shared prompts)
 .lsp/
+.claude/settings.local.json

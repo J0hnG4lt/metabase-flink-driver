@@ -59,7 +59,7 @@
 ;; ----------------------------------------
 
 (doseq [[feature supported?]
-        {:describe-fields           true
+        {:describe-fields           true  ;; Use custom describe-fields implementation
          :connection-impersonation  false
          :convert-timezone          false
          :test/jvm-timezone-setting false
@@ -261,11 +261,15 @@
   [& args]
   (apply (get-method sql-jdbc.sync/active-tables :sql-jdbc) args))
 
+(declare initialize-session!)
+
 (defmethod driver/describe-database :flink-sql
   [_driver database]
   (let [jdbc-url (get-jdbc-url-from-db database)]
     (try
       (with-open [conn (DriverManager/getConnection jdbc-url)]
+        ;; Initialize session with tables before describing
+        (initialize-session! conn)
         (with-open [stmt (.createStatement conn)]
           (let [has-rs (.execute stmt "SHOW TABLES")]
             (if has-rs
@@ -287,8 +291,10 @@
         table-name (:name table)]
     (try
       (with-open [conn (DriverManager/getConnection jdbc-url)]
+        ;; Initialize session with tables before describing
+        (initialize-session! conn)
         (with-open [stmt (.createStatement conn)]
-          (let [has-rs (.execute stmt (str "DESCRIBE " table-name))]
+          (let [has-rs (.execute stmt (str "DESCRIBE `" table-name "`"))]
             (if has-rs
               (with-open [rs (.getResultSet stmt)]
                 (let [columns (loop [idx 0, results []]
@@ -314,6 +320,66 @@
 (defmethod driver/describe-table-fks :flink-sql
   [_driver _database _table]
   #{})
+
+;; ----------------------------------------
+;; Describe Fields (for field sync)
+;; ----------------------------------------
+
+(defmethod driver/describe-fields :flink-sql
+  [driver database & {:keys [table-names]}]
+  ;; Returns a reducible of field metadata for all tables (or specified tables)
+  (let [jdbc-url (get-jdbc-url-from-db database)]
+    (reify clojure.lang.IReduceInit
+      (reduce [_ rf init]
+        (try
+          (with-open [conn (DriverManager/getConnection jdbc-url)]
+            ;; Initialize session with tables
+            (initialize-session! conn)
+            ;; Get list of tables to describe
+            (let [tables-to-describe (if (seq table-names)
+                                       table-names
+                                       ;; Get all tables via SHOW TABLES
+                                       (with-open [stmt (.createStatement conn)]
+                                         (let [has-rs (.execute stmt "SHOW TABLES")]
+                                           (if has-rs
+                                             (with-open [rs (.getResultSet stmt)]
+                                               (loop [tables []]
+                                                 (if (.next rs)
+                                                   (recur (conj tables (.getString rs 1)))
+                                                   tables)))
+                                             []))))]
+              ;; For each table, get its columns
+              (reduce
+               (fn [acc table-name]
+                 (try
+                   (with-open [stmt (.createStatement conn)]
+                     (let [has-rs (.execute stmt (str "DESCRIBE `" table-name "`"))]
+                       (if has-rs
+                         (with-open [rs (.getResultSet stmt)]
+                           (loop [acc acc, idx 0]
+                             (if (.next rs)
+                               (let [col-name (.getString rs 1)
+                                     col-type (.getString rs 2)
+                                     ;; Column 3 is nullable (Boolean in Flink)
+                                     nullable (try (.getBoolean rs 3) (catch Exception _ true))
+                                     field-meta {:table-name     table-name
+                                                 :name           col-name
+                                                 :database-type  col-type
+                                                 :base-type      (sql-jdbc.sync/database-type->base-type driver col-type)
+                                                 :database-position idx
+                                                 :database-required (not nullable)
+                                                 :database-is-auto-increment false}]
+                                 (recur (rf acc field-meta) (inc idx)))
+                               acc)))
+                         acc)))
+                   (catch Exception e
+                     (log/warn e (str "Failed to describe table: " table-name))
+                     acc)))
+               init
+               tables-to-describe)))
+          (catch Exception e
+            (log/warn e "Failed in describe-fields")
+            init))))))
 
 ;; ----------------------------------------
 ;; SQL Generation
@@ -377,6 +443,109 @@
   #{"information_schema" "INFORMATION_SCHEMA"})
 
 ;; ----------------------------------------
+;; Session Initialization SQL
+;; ----------------------------------------
+
+;; Default SQL to create tables in each session (for testing)
+;; These tables use the datagen connector with bounded rows for batch queries
+(def ^:private default-init-sql
+  ["CREATE TABLE IF NOT EXISTS users (
+      user_id INT,
+      username STRING,
+      email STRING,
+      created_at TIMESTAMP(3),
+      age INT,
+      country STRING
+    ) WITH (
+      'connector' = 'datagen',
+      'number-of-rows' = '100',
+      'fields.user_id.kind' = 'sequence',
+      'fields.user_id.start' = '1',
+      'fields.user_id.end' = '100',
+      'fields.username.length' = '10',
+      'fields.email.length' = '15',
+      'fields.age.min' = '18',
+      'fields.age.max' = '80',
+      'fields.country.length' = '5'
+    )"
+   "CREATE TABLE IF NOT EXISTS orders (
+      order_id INT,
+      user_id INT,
+      product_name STRING,
+      quantity INT,
+      unit_price DECIMAL(10, 2),
+      order_time TIMESTAMP(3),
+      status STRING
+    ) WITH (
+      'connector' = 'datagen',
+      'number-of-rows' = '500',
+      'fields.order_id.kind' = 'sequence',
+      'fields.order_id.start' = '1',
+      'fields.order_id.end' = '500',
+      'fields.user_id.min' = '1',
+      'fields.user_id.max' = '100',
+      'fields.product_name.length' = '12',
+      'fields.quantity.min' = '1',
+      'fields.quantity.max' = '10',
+      'fields.unit_price.min' = '1',
+      'fields.unit_price.max' = '500',
+      'fields.status.length' = '8'
+    )"
+   "CREATE TABLE IF NOT EXISTS products (
+      product_id INT,
+      product_name STRING,
+      category STRING,
+      price DECIMAL(10, 2),
+      stock_quantity INT,
+      last_updated TIMESTAMP(3)
+    ) WITH (
+      'connector' = 'datagen',
+      'number-of-rows' = '50',
+      'fields.product_id.kind' = 'sequence',
+      'fields.product_id.start' = '1',
+      'fields.product_id.end' = '50',
+      'fields.product_name.length' = '15',
+      'fields.category.length' = '8',
+      'fields.price.min' = '5',
+      'fields.price.max' = '1000',
+      'fields.stock_quantity.min' = '0',
+      'fields.stock_quantity.max' = '500'
+    )"
+   "CREATE TABLE IF NOT EXISTS page_views (
+      view_id BIGINT,
+      user_id INT,
+      page_url STRING,
+      referrer STRING,
+      view_time TIMESTAMP(3),
+      session_id STRING,
+      device_type STRING
+    ) WITH (
+      'connector' = 'datagen',
+      'number-of-rows' = '1000',
+      'fields.view_id.kind' = 'sequence',
+      'fields.view_id.start' = '1',
+      'fields.view_id.end' = '1000',
+      'fields.user_id.min' = '1',
+      'fields.user_id.max' = '100',
+      'fields.page_url.length' = '20',
+      'fields.referrer.length' = '15',
+      'fields.session_id.length' = '32',
+      'fields.device_type.length' = '6'
+    )"])
+
+(defn- initialize-session!
+  "Execute initialization SQL to create tables in this session."
+  [^Connection conn]
+  (log/info "Initializing Flink session with default tables...")
+  (with-open [stmt (.createStatement conn)]
+    (doseq [sql default-init-sql]
+      (try
+        (.execute stmt sql)
+        (log/debug "Executed init SQL successfully")
+        (catch Exception e
+          (log/debug "Init SQL execution (may be expected if table exists):" (.getMessage e)))))))
+
+;; ----------------------------------------
 ;; Connection Workarounds
 ;; ----------------------------------------
 
@@ -392,6 +561,8 @@
       (try
         (.setAutoCommit conn true)
         (catch Exception _))
+      ;; Initialize the session with default tables
+      (initialize-session! conn)
       (f conn))))
 
 ;; ----------------------------------------

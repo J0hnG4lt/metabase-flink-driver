@@ -79,14 +79,16 @@ services:
         condition: service_healthy
     ports:
       - "8083:8083"   # SQL Gateway REST endpoint
-    command: ["bash", "-c", "echo 'Waiting for JobManager...' && sleep 10 && echo 'Starting SQL Gateway...' && /opt/flink/bin/sql-gateway.sh start-foreground -Dsql-gateway.endpoint.rest.address=0.0.0.0 -Dsql-gateway.endpoint.rest.port=8083 -Dsql-gateway.session.idle-timeout=10min -Djobmanager.rpc.address=jobmanager"]
+    command: ["bash", "-c", "echo 'Waiting for JobManager...' && sleep 10 && echo 'Starting SQL Gateway...' && /opt/flink/bin/sql-gateway.sh start-foreground -Dsql-gateway.endpoint.rest.address=0.0.0.0 -Dsql-gateway.endpoint.rest.port=8083 -Dsql-gateway.session.idle-timeout=60min -Dsql-gateway.session.check-interval=1min -Djobmanager.rpc.address=jobmanager -Drest.address=jobmanager -Drest.port=8081 -Dexecution.target=remote"]
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        rest.port: 8081
+        execution.target: remote
     volumes:
       - ./data:/opt/flink/data
-      - ./scripts/init-flink.sql:/opt/flink/init.sql:ro
     networks:
       - flink-net
     healthcheck:
@@ -96,7 +98,7 @@ services:
       retries: 15
 
   # ----------------------------------------
-  # PostgreSQL (Metabase application database)
+  # PostgreSQL (Metabase + Flink Catalog database)
   # ----------------------------------------
   postgres:
     image: postgres:16-alpine
@@ -106,6 +108,7 @@ services:
       POSTGRES_DB: metabase
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init-catalog.sql:ro
     networks:
       - flink-net
     healthcheck:
@@ -160,21 +163,6 @@ services:
       interval: 15s
       timeout: 10s
       retries: 20
-
-  # ----------------------------------------
-  # Data Generator (creates sample tables in Flink)
-  # ----------------------------------------
-  data-generator:
-    image: flink:1.20-java17
-    depends_on:
-      sql-gateway:
-        condition: service_healthy
-    volumes:
-      - ./scripts:/scripts:ro
-      - ./data:/data
-    command: ["bash", "-c", "echo 'Waiting for SQL Gateway to be fully ready...' && sleep 15 && echo 'Creating sample tables...' && /opt/flink/bin/sql-client.sh -f /scripts/init-flink.sql && echo 'Sample data created!' && sleep infinity"]
-    networks:
-      - flink-net
 
 networks:
   flink-net:

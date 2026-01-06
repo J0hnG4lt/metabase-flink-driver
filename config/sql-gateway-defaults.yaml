@@ -1,0 +1,15 @@
+# SQL Gateway configuration
+# This file configures session defaults for all connections
+
+# Execution configuration
+execution:
+  target: remote
+
+# Flink cluster configuration
+jobmanager:
+  rpc:
+    address: jobmanager
+
+rest:
+  address: jobmanager
+  port: 8081

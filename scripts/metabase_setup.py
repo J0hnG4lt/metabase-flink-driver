@@ -193,7 +193,7 @@ class MetabaseSetup:
             return False
 
     def list_tables(self, db_id: int) -> list:
-        """List tables in database."""
+        """List tables in database with field info."""
         try:
             response = requests.get(
                 f"{self.base_url}/api/database/{db_id}/metadata",
@@ -203,11 +203,28 @@ class MetabaseSetup:
             if response.status_code == 200:
                 data = response.json()
                 tables = data.get("tables", [])
-                return [t.get("name") for t in tables]
+                return tables
             return []
         except Exception as e:
             print(f"Error listing tables: {e}")
             return []
+
+    def run_query(self, db_id: int, query: str) -> dict:
+        """Run a native SQL query."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/dataset",
+                headers=self._headers(),
+                json={
+                    "database": db_id,
+                    "type": "native",
+                    "native": {"query": query}
+                },
+                timeout=60,
+            )
+            return response.json()
+        except Exception as e:
+            return {"error": str(e)}
 
     def create_simple_question(
         self, db_id: int, table_name: str, name: str
@@ -322,21 +339,48 @@ def main():
 
     tables = setup.list_tables(db_id)
     if tables:
-        print(f"\nDiscovered tables: {tables}")
-
-        # Create sample questions for each table
-        for table in tables[:5]:  # Limit to first 5 tables
-            setup.create_simple_question(
-                db_id, table, f"{table.title()} Overview"
-            )
+        print(f"\nDiscovered {len(tables)} tables:")
+        for table in tables:
+            fields = table.get("fields", [])
+            print(f"  - {table.get('name')}: {len(fields)} fields")
     else:
         print("No tables discovered yet. You may need to wait for the sync to complete.")
+        sys.exit(1)
+
+    # Test queries
+    print("\n--- Testing Queries ---")
+    test_queries = [
+        ("SELECT COUNT(*) as cnt FROM users", "User count"),
+        ("SELECT * FROM orders LIMIT 3", "Orders sample"),
+        ("SELECT COUNT(*) as cnt FROM products", "Product count"),
+    ]
+
+    all_passed = True
+    for query, description in test_queries:
+        print(f"\nTest: {description}")
+        print(f"Query: {query}")
+        result = setup.run_query(db_id, query)
+        if result.get("status") == "completed":
+            rows = result.get("data", {}).get("rows", [])
+            print(f"Result: SUCCESS - {len(rows)} rows returned")
+            if rows:
+                print(f"First row: {rows[0]}")
+        else:
+            error = result.get("error", "Unknown error")
+            print(f"Result: FAILED - {str(error)[:200]}")
+            all_passed = False
 
     print("\n" + "=" * 50)
     print("Setup complete!")
     print(f"Metabase URL: http://{args.host}:{args.port}")
     print(f"Login: {args.admin_email} / {args.admin_password}")
+    print(f"Database ID: {db_id}")
+    print(f"Tables: {len(tables)}")
+    print(f"Query Tests: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
     print("=" * 50)
+
+    if not all_passed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
