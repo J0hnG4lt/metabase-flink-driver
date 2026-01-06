@@ -12,21 +12,34 @@ This driver allows Metabase to connect to Apache Flink SQL Gateway, enabling you
 ## Requirements
 
 - Metabase v0.50+ (tested with v0.57.7)
-- Apache Flink 2.0+ with SQL Gateway enabled (tested with 2.1.1)
+- Apache Flink 1.18+ with SQL Gateway enabled
 - Java 17+ (Java 21 also supported)
+
+## Flink Version Compatibility
+
+**Important**: Download the JAR that matches your Flink SQL Gateway version.
+
+| Your Flink Version | Download JAR |
+|-------------------|--------------|
+| Flink 1.18.x | `metabase-flink-driver-1.0.0-flink-1.18.jar` |
+| Flink 1.19.x | `metabase-flink-driver-1.0.0-flink-1.19.jar` |
+| Flink 1.20.x | `metabase-flink-driver-1.0.0-flink-1.20.jar` |
+| Flink 2.0.x / 2.1.x | `metabase-flink-driver-1.0.0-flink-2.1.jar` |
+
+The JDBC driver version must match the SQL Gateway version for proper REST API compatibility.
 
 ## Installation
 
 ### Option 1: Download Pre-built JAR
 
-Download the latest release JAR and place it in your Metabase plugins directory:
+Download the JAR for your Flink version from the [Releases page](https://github.com/J0hnG4lt/metabase-flink-driver/releases):
 
 ```bash
 # Create plugins directory if it doesn't exist
 mkdir -p /path/to/metabase/plugins
 
-# Copy the JAR
-cp metabase-flink-driver-1.0.0-SNAPSHOT.jar /path/to/metabase/plugins/
+# Copy the JAR (use the version matching your Flink cluster)
+cp metabase-flink-driver-1.0.0-flink-2.1.jar /path/to/metabase/plugins/
 
 # Restart Metabase
 ```
@@ -38,11 +51,17 @@ cp metabase-flink-driver-1.0.0-SNAPSHOT.jar /path/to/metabase/plugins/
 git clone https://github.com/J0hnG4lt/metabase-flink-driver.git
 cd metabase-flink-driver
 
-# Build the driver JAR
-clj -T:build uber
+# Build for a specific Flink version (default: 2.1)
+clojure -T:build uber                              # Builds for Flink 2.1
+clojure -T:build uber :flink-version '"1.18"'      # Builds for Flink 1.18
+clojure -T:build uber :flink-version '"1.19"'      # Builds for Flink 1.19
+clojure -T:build uber :flink-version '"1.20"'      # Builds for Flink 1.20
+
+# Or build all versions at once
+clojure -T:build uber-all
 
 # Copy to Metabase plugins
-cp target/metabase-flink-driver-1.0.0-SNAPSHOT.jar /path/to/metabase/plugins/
+cp target/metabase-flink-driver-1.0.0-flink-*.jar /path/to/metabase/plugins/
 ```
 
 ## Configuration
