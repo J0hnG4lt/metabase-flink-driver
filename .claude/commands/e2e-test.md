@@ -123,6 +123,41 @@ print(f'Rows: {len(d.get(\"data\",{}).get(\"rows\",[]))}')
 | Page views count | 100,000 |
 | Connection test | Passes |
 | All bounded queries | Pass |
+| DDL tests (CREATE, DROP, USE, SET) | Pass |
+| Catalog exploration (SHOW CATALOGS, etc.) | Pass |
+
+## DDL Statement Tests
+
+The setup script tests DDL statement support:
+
+| Statement | Expected |
+|-----------|----------|
+| CREATE TABLE ... | Returns "OK" |
+| DROP TABLE ... | Returns "OK" |
+| USE CATALOG ... | Returns "OK" |
+| USE database | Returns "OK" |
+| SET 'key' = 'value' | Returns "OK" |
+
+**Note**: Tables created via DDL are **session-scoped**. They won't persist across queries.
+
+## Catalog and Schema Exploration
+
+The driver supports multi-catalog and multi-database environments:
+
+| Query | Expected |
+|-------|----------|
+| SHOW CATALOGS | Lists all catalogs (e.g., default_catalog) |
+| SHOW DATABASES | Lists databases in current catalog |
+| SHOW CURRENT CATALOG | Shows current catalog |
+| SHOW CURRENT DATABASE | Shows current database |
+
+### Catalog/Database Connection Properties
+
+When creating a database connection in Metabase, you can specify:
+- **Catalog**: The Flink catalog to use (e.g., `default_catalog`, `hive_catalog`)
+- **Database**: The database within the catalog (e.g., `default_database`)
+
+The driver issues `USE CATALOG` and `USE DATABASE` statements at connection time.
 
 ## Table Types
 

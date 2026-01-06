@@ -53,9 +53,27 @@ When adding a new database in Metabase, select "Flink SQL" and configure:
 |-------|-------------|---------|
 | Host | Flink SQL Gateway hostname | localhost |
 | Port | SQL Gateway REST port | 8083 |
-| Catalog | Flink catalog name (optional) | - |
-| Database | Flink database name (optional) | - |
+| Catalog | Flink catalog name (optional) | default_catalog |
+| Database | Flink database name (optional) | default_database |
 | Additional Options | Extra JDBC URL parameters | - |
+
+### Multi-Catalog Support
+
+The driver supports Flink's multi-catalog architecture. When you specify a Catalog and Database:
+
+1. The driver connects to the SQL Gateway
+2. Executes `USE CATALOG <catalog>` to switch to the specified catalog
+3. Executes `USE <database>` to switch to the specified database
+4. All subsequent queries run in that context
+
+**Available Catalogs**: Use `SHOW CATALOGS` in a native query to see available catalogs.
+
+**Catalog Types**:
+- `default_catalog` - In-memory catalog (session-scoped tables)
+- `hive_catalog` - Hive Metastore integration (persistent tables)
+- Custom catalogs configured in your Flink cluster
+
+To work with persistent tables across sessions, configure a Hive catalog or other persistent catalog in your Flink cluster.
 
 ## Quick Start with Docker
 

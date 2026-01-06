@@ -101,26 +101,61 @@
 
 (defmethod sql-jdbc.conn/connection-details->spec :flink-sql
   [_driver {:keys [host port catalog database additional-options] :as _details}]
+  ;; Note: Flink JDBC URL format is jdbc:flink://host:port
+  ;; Catalog and database are NOT supported in the URL path (unlike MySQL/Postgres)
+  ;; Instead, we issue USE CATALOG and USE DATABASE statements after connecting
   (let [host           (or host "localhost")
         port           (or port 8083)
-        path-parts     (remove str/blank? [catalog database])
-        path           (if (seq path-parts)
-                         (str "/" (str/join "/" path-parts))
-                         "")
         query-string   (when-not (str/blank? additional-options)
                          (str "?" additional-options))
-        jdbc-url       (str "jdbc:flink://" host ":" port path query-string)]
+        jdbc-url       (str "jdbc:flink://" host ":" port (or query-string ""))]
     (log/debug "Flink SQL JDBC URL:" jdbc-url)
+    (log/debug "Flink catalog:" catalog "database:" database "(set via USE statements)")
     {:classname   "org.apache.flink.table.jdbc.FlinkDriver"
      :subprotocol "flink"
-     :subname     (str "//" host ":" port path query-string)}))
+     :subname     (str "//" host ":" port (or query-string ""))
+     ;; Store catalog/database for use in initialize-session!
+     :flink-catalog catalog
+     :flink-database database}))
+
+;; Helper to extract catalog/database from various input types
+(defn- get-catalog-database
+  "Extract catalog and database settings from database spec or details.
+   Returns {:catalog \"...\" :database \"...\"} or empty map if not set."
+  [db-or-id-or-spec]
+  (cond
+    ;; Connection spec with flink-catalog/flink-database keys
+    (and (map? db-or-id-or-spec) (:flink-catalog db-or-id-or-spec))
+    {:catalog  (:flink-catalog db-or-id-or-spec)
+     :database (:flink-database db-or-id-or-spec)}
+
+    ;; Database map with details
+    (and (map? db-or-id-or-spec) (:details db-or-id-or-spec))
+    (let [details (:details db-or-id-or-spec)]
+      {:catalog  (:catalog details)
+       :database (:database details)})
+
+    ;; Integer ID - lookup from Metabase DB
+    (integer? db-or-id-or-spec)
+    (try
+      (require 'metabase.lib.metadata.jvm)
+      (let [metadata-provider ((resolve 'metabase.lib.metadata.jvm/application-database-metadata-provider) db-or-id-or-spec)
+            db-info           ((resolve 'metabase.lib.metadata.protocols/database) metadata-provider)
+            details           (:details db-info)]
+        {:catalog  (:catalog details)
+         :database (:database details)})
+      (catch Exception e
+        (log/debug "Could not get catalog/database for DB ID" db-or-id-or-spec ":" (.getMessage e))
+        {}))
+
+    :else {}))
 
 ;; Helper to extract JDBC URL from database spec (used throughout driver)
 (defn- get-jdbc-url-from-db
   "Extract JDBC URL from database or spec. Works with both database maps and IDs."
   [db-or-id-or-spec]
   (cond
-    ;; Handle connection spec with subname directly (e.g. {:subprotocol "flink" :subname "//host:port/..."})
+    ;; Handle connection spec with subname directly (e.g. {:subprotocol "flink" :subname "//host:port"})
     (and (map? db-or-id-or-spec) (:subname db-or-id-or-spec))
     (let [subname (:subname db-or-id-or-spec)]
       (log/info "Building Flink JDBC URL from spec subname:" subname)
@@ -190,16 +225,12 @@
                     :else {})
           host    (or (:host details) "localhost")
           port    (or (:port details) 8083)
-          catalog (:catalog details)
-          database (:database details)
-          path-parts (remove str/blank? [catalog database])
-          path       (if (seq path-parts)
-                       (str "/" (str/join "/" path-parts))
-                       "")
+          ;; Note: catalog/database are NOT included in URL - Flink JDBC doesn't support it
+          ;; They are handled via USE statements in initialize-session!
           options (:additional-options details)
           query   (when-not (str/blank? options) (str "?" options))]
       (log/info "Building Flink JDBC URL - host:" host "port:" port "from:" (type db-or-id-or-spec))
-      (str "jdbc:flink://" host ":" port path query))))
+      (str "jdbc:flink://" host ":" port (or query "")))))
 
 ;; ----------------------------------------
 ;; Connection Testing
@@ -292,11 +323,14 @@
 
 (defmethod driver/describe-database :flink-sql
   [_driver database]
-  (let [jdbc-url (get-jdbc-url-from-db database)]
+  (let [jdbc-url (get-jdbc-url-from-db database)
+        cat-db   (get-catalog-database database)
+        catalog  (:catalog cat-db)
+        db-name  (:database cat-db)]
     (try
       (with-open [conn (get-flink-connection jdbc-url)]
-        ;; Initialize session with tables before describing
-        (initialize-session! conn)
+        ;; Initialize session with tables before describing (with catalog/database)
+        (initialize-session! conn catalog db-name)
         (with-open [stmt (.createStatement conn)]
           (let [has-rs (.execute stmt "SHOW TABLES")]
             (if has-rs
@@ -315,11 +349,14 @@
 (defmethod driver/describe-table :flink-sql
   [driver database table]
   (let [jdbc-url   (get-jdbc-url-from-db database)
+        cat-db     (get-catalog-database database)
+        catalog    (:catalog cat-db)
+        db-name    (:database cat-db)
         table-name (:name table)]
     (try
       (with-open [conn (get-flink-connection jdbc-url)]
-        ;; Initialize session with tables before describing
-        (initialize-session! conn)
+        ;; Initialize session with tables before describing (with catalog/database)
+        (initialize-session! conn catalog db-name)
         (with-open [stmt (.createStatement conn)]
           (let [has-rs (.execute stmt (str "DESCRIBE `" table-name "`"))]
             (if has-rs
@@ -355,13 +392,16 @@
 (defmethod driver/describe-fields :flink-sql
   [driver database & {:keys [table-names]}]
   ;; Returns a reducible of field metadata for all tables (or specified tables)
-  (let [jdbc-url (get-jdbc-url-from-db database)]
+  (let [jdbc-url (get-jdbc-url-from-db database)
+        cat-db   (get-catalog-database database)
+        catalog  (:catalog cat-db)
+        db-name  (:database cat-db)]
     (reify clojure.lang.IReduceInit
       (reduce [_ rf init]
         (try
           (with-open [conn (get-flink-connection jdbc-url)]
-            ;; Initialize session with tables
-            (initialize-session! conn)
+            ;; Initialize session with tables (with catalog/database)
+            (initialize-session! conn catalog db-name)
             ;; Get list of tables to describe
             (let [tables-to-describe (if (seq table-names)
                                        table-names
@@ -605,16 +645,35 @@
     )"])
 
 (defn- initialize-session!
-  "Execute initialization SQL to create tables in this session."
-  [^Connection conn]
-  (log/info "Initializing Flink session with default tables...")
-  (with-open [stmt (.createStatement conn)]
-    (doseq [sql default-init-sql]
-      (try
-        (.execute stmt sql)
-        (log/debug "Executed init SQL successfully")
-        (catch Exception e
-          (log/debug "Init SQL execution (may be expected if table exists):" (.getMessage e)))))))
+  "Execute initialization SQL to create tables in this session.
+   If catalog and database are provided, switches to them first via USE statements."
+  ([^Connection conn]
+   (initialize-session! conn nil nil))
+  ([^Connection conn catalog database]
+   (log/info "Initializing Flink session..." (when catalog (str "catalog=" catalog)) (when database (str "database=" database)))
+   (with-open [stmt (.createStatement conn)]
+     ;; Set catalog/database if provided
+     (when (and catalog (not (str/blank? catalog)))
+       (try
+         (let [use-catalog (str "USE CATALOG `" catalog "`")]
+           (log/info "Setting catalog:" use-catalog)
+           (.execute stmt use-catalog))
+         (catch Exception e
+           (log/warn "Failed to set catalog" catalog ":" (.getMessage e)))))
+     (when (and database (not (str/blank? database)))
+       (try
+         (let [use-db (str "USE `" database "`")]
+           (log/info "Setting database:" use-db)
+           (.execute stmt use-db))
+         (catch Exception e
+           (log/warn "Failed to set database" database ":" (.getMessage e)))))
+     ;; Create default tables
+     (doseq [sql default-init-sql]
+       (try
+         (.execute stmt sql)
+         (log/debug "Executed init SQL successfully")
+         (catch Exception e
+           (log/debug "Init SQL execution (may be expected if table exists):" (.getMessage e))))))))
 
 ;; ----------------------------------------
 ;; Connection Workarounds
@@ -626,14 +685,17 @@
 (defmethod sql-jdbc.execute/do-with-connection-with-options :flink-sql
   [_driver db-or-id-or-spec _options f]
   ;; Bypass c3p0 pooling - Flink JDBC doesn't support clearWarnings() and other operations
-  (let [jdbc-url (get-jdbc-url-from-db db-or-id-or-spec)]
-    (log/debug "Opening direct Flink connection to:" jdbc-url)
+  (let [jdbc-url    (get-jdbc-url-from-db db-or-id-or-spec)
+        cat-db      (get-catalog-database db-or-id-or-spec)
+        catalog     (:catalog cat-db)
+        database    (:database cat-db)]
+    (log/debug "Opening direct Flink connection to:" jdbc-url "catalog:" catalog "database:" database)
     (with-open [conn (get-flink-connection jdbc-url)]
       (try
         (.setAutoCommit conn true)
         (catch Exception _))
-      ;; Initialize the session with default tables
-      (initialize-session! conn)
+      ;; Initialize the session with default tables (and set catalog/database if specified)
+      (initialize-session! conn catalog database)
       (f conn))))
 
 ;; NOTE: describe-database, describe-table, and describe-fields also use get-flink-connection

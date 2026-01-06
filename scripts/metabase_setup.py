@@ -395,6 +395,84 @@ def main():
             print(f"Result: FAILED - {str(error)[:200]}")
             all_passed = False
 
+    # Test DDL statements
+    print("\n" + "=" * 50)
+    print("DDL STATEMENT TESTS")
+    print("=" * 50)
+    print("Testing CREATE TABLE, DROP TABLE via native queries")
+
+    ddl_tests = [
+        # CREATE TABLE - should return OK
+        ("""CREATE TABLE IF NOT EXISTS ddl_test_table (
+            id INT,
+            name STRING,
+            value DOUBLE
+        ) WITH (
+            'connector' = 'datagen',
+            'number-of-rows' = '50',
+            'fields.id.kind' = 'sequence',
+            'fields.id.start' = '1',
+            'fields.id.end' = '50'
+        )""", "CREATE TABLE ddl_test_table"),
+
+        # DROP TABLE - should return OK
+        ("DROP TABLE IF EXISTS ddl_test_table", "DROP TABLE ddl_test_table"),
+
+        # USE statement
+        ("USE CATALOG default_catalog", "USE CATALOG"),
+        ("USE default_database", "USE DATABASE"),
+
+        # SET statement
+        ("SET 'table.local-time-zone' = 'UTC'", "SET configuration"),
+    ]
+
+    ddl_passed = True
+    for query, description in ddl_tests:
+        print(f"\nTest: {description}")
+        print(f"Query: {query[:60]}{'...' if len(query) > 60 else ''}")
+        result = setup.run_query(db_id, query)
+        status = result.get("status")
+        if status == "completed":
+            rows = result.get("data", {}).get("rows", [])
+            print(f"Result: SUCCESS - {rows}")
+        else:
+            error = result.get("error", "Unknown error")
+            print(f"Result: FAILED - {str(error)[:150]}")
+            ddl_passed = False
+
+    print(f"\nDDL Tests: {'ALL PASSED' if ddl_passed else 'SOME FAILED'}")
+    if not ddl_passed:
+        all_passed = False
+
+    # Test catalog and schema exploration
+    print("\n" + "=" * 50)
+    print("CATALOG AND SCHEMA EXPLORATION")
+    print("=" * 50)
+    print("Testing multi-catalog and schema support")
+
+    catalog_queries = [
+        ("SHOW CATALOGS", "List all catalogs"),
+        ("SHOW DATABASES", "List databases in current catalog"),
+        ("SHOW CURRENT CATALOG", "Show current catalog"),
+        ("SHOW CURRENT DATABASE", "Show current database"),
+        ("SHOW TABLES", "List tables in current database"),
+    ]
+
+    for query, description in catalog_queries:
+        print(f"\nTest: {description}")
+        print(f"Query: {query}")
+        result = setup.run_query(db_id, query)
+        if result.get("status") == "completed":
+            rows = result.get("data", {}).get("rows", [])
+            print(f"Result: SUCCESS")
+            for row in rows[:10]:  # Limit output
+                print(f"  {row}")
+            if len(rows) > 10:
+                print(f"  ... and {len(rows) - 10} more")
+        else:
+            error = result.get("error", "Unknown error")
+            print(f"Result: FAILED - {str(error)[:150]}")
+
     # Document the streaming table limitation
     print("\n" + "=" * 50)
     print("STREAMING TABLE LIMITATION")
