@@ -1,0 +1,23 @@
+# Clojure
+.cpcache/
+.nrepl-port
+target/
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.clj-kondo/.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+/data/*.csv
+/data/*.parquet
+*.log
+
+# Claude
+.claude/

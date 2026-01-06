@@ -1,0 +1,189 @@
+services:
+  # ----------------------------------------
+  # Build the Metabase Flink SQL Driver JAR
+  # ----------------------------------------
+  builder:
+    image: clojure:temurin-21-tools-deps-1.11.1.1435-alpine
+    working_dir: /build
+    volumes:
+      - .:/build
+      - driver-jar:/build/target
+      - maven-cache:/root/.m2
+    command: >
+      sh -c "
+        echo 'Building Metabase Flink SQL Driver...' &&
+        clojure -T:build uber &&
+        echo 'Build complete!' &&
+        ls -la target/*.jar
+      "
+    networks:
+      - flink-net
+
+  # ----------------------------------------
+  # Flink JobManager
+  # ----------------------------------------
+  jobmanager:
+    image: flink:1.20-java17
+    ports:
+      - "8081:8081"   # Flink Web UI
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        heartbeat.timeout: 60000
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - ./data:/opt/flink/data
+    networks:
+      - flink-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------
+  # Flink TaskManager
+  # ----------------------------------------
+  taskmanager:
+    image: flink:1.20-java17
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    scale: 1
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        heartbeat.timeout: 60000
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - ./data:/opt/flink/data
+    networks:
+      - flink-net
+
+  # ----------------------------------------
+  # Flink SQL Gateway
+  # ----------------------------------------
+  sql-gateway:
+    image: flink:1.20-java17
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    ports:
+      - "8083:8083"   # SQL Gateway REST endpoint
+    command: ["bash", "-c", "echo 'Waiting for JobManager...' && sleep 10 && echo 'Starting SQL Gateway...' && /opt/flink/bin/sql-gateway.sh start-foreground -Dsql-gateway.endpoint.rest.address=0.0.0.0 -Dsql-gateway.endpoint.rest.port=8083 -Dsql-gateway.session.idle-timeout=10min -Djobmanager.rpc.address=jobmanager"]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes:
+      - ./data:/opt/flink/data
+      - ./scripts/init-flink.sql:/opt/flink/init.sql:ro
+    networks:
+      - flink-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ----------------------------------------
+  # PostgreSQL (Metabase application database)
+  # ----------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: metabase
+      POSTGRES_PASSWORD: metabase
+      POSTGRES_DB: metabase
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - flink-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metabase"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------
+  # Metabase
+  # ----------------------------------------
+  # Copy driver JAR to plugins volume with proper permissions
+  plugin-init:
+    image: alpine:latest
+    depends_on:
+      builder:
+        condition: service_completed_successfully
+    volumes:
+      - driver-jar:/driver-jar:ro
+      - metabase-plugins:/plugins
+    command: ["sh", "-c", "cp /driver-jar/*.jar /plugins/ && chmod -R 777 /plugins && ls -la /plugins/ && echo 'Plugin copied with permissions!'"]
+    networks:
+      - flink-net
+
+  metabase:
+    image: metabase/metabase:v0.52.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sql-gateway:
+        condition: service_healthy
+      plugin-init:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"   # Metabase Web UI
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: metabase
+      MB_DB_PASS: metabase
+      MB_DB_HOST: postgres
+      MB_PLUGINS_DIR: /plugins
+      JAVA_TOOL_OPTIONS: "-Xmx2g"
+    volumes:
+      - metabase-plugins:/plugins
+      - metabase-data:/metabase-data
+    networks:
+      - flink-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # ----------------------------------------
+  # Data Generator (creates sample tables in Flink)
+  # ----------------------------------------
+  data-generator:
+    image: flink:1.20-java17
+    depends_on:
+      sql-gateway:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./data:/data
+    command: ["bash", "-c", "echo 'Waiting for SQL Gateway to be fully ready...' && sleep 15 && echo 'Creating sample tables...' && /opt/flink/bin/sql-client.sh -f /scripts/init-flink.sql && echo 'Sample data created!' && sleep infinity"]
+    networks:
+      - flink-net
+
+networks:
+  flink-net:
+    driver: bridge
+
+volumes:
+  driver-jar:
+  maven-cache:
+  postgres-data:
+  metabase-data:
+  metabase-plugins:
+  flink-checkpoints:

@@ -1,0 +1,43 @@
+info:
+  name: Metabase Flink SQL Driver
+  version: 1.0.0-SNAPSHOT
+  description: Allows Metabase to connect to Apache Flink SQL Gateway via JDBC
+
+contact-info:
+  name: Metabase Flink SQL Driver
+  address: https://github.com/J0hnG4lt/metabase-flink-driver/issues
+
+driver:
+  name: flink-sql
+  display-name: Flink SQL
+  lazy-load: true
+  parent: sql-jdbc
+  connection-properties:
+    - host
+    - merge:
+        - port
+        - default: 8083
+    - name: catalog
+      display-name: Catalog
+      helper-text: The catalog name to use (optional)
+      placeholder: default_catalog
+      required: false
+    - name: database
+      display-name: Database
+      helper-text: The database name to use (optional)
+      placeholder: default_database
+      required: false
+    - name: additional-options
+      display-name: Additional JDBC connection options
+      helper-text: Additional options to append to the JDBC connection string (e.g., key1=value1&key2=value2)
+      placeholder: "key1=value1&key2=value2"
+      required: false
+      visible-if:
+        advanced-options: true
+  connection-properties-include-tunnel-config: true
+
+init:
+  - step: load-namespace
+    namespace: metabase.driver.flink-sql
+  - step: register-jdbc-driver
+    class: org.apache.flink.table.jdbc.FlinkDriver

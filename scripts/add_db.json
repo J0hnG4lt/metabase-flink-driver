@@ -1,0 +1,10 @@
+{
+  "engine": "flink-sql",
+  "name": "Flink SQL Gateway",
+  "details": {
+    "host": "sql-gateway",
+    "port": 8083,
+    "catalog": "default_catalog",
+    "database": "default_database"
+  }
+}
